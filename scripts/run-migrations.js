@@ -38,15 +38,27 @@ try {
 }
 
 // Configuration
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const RAW_SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const MIGRATIONS_DIR = path.join(__dirname, '..', 'supabase');
 
 // Validate environment variables
-if (!SUPABASE_URL || !SUPABASE_KEY) {
+if (!RAW_SUPABASE_URL || !SUPABASE_KEY) {
   console.error('❌ Error: Missing required environment variables');
   console.error('   Required: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)');
   console.error('   Required: SUPABASE_KEY (or NEXT_PUBLIC_SUPABASE_ANON_KEY)');
+  process.exit(1);
+}
+
+// Supabase client expects the bare project origin (e.g. https://xxx.supabase.co).
+// It appends its own /rest/v1/... path internally, so a value that already
+// includes a path (e.g. a copy-pasted REST endpoint) produces a doubled,
+// invalid request path. Normalize down to the origin to guard against that.
+let SUPABASE_URL;
+try {
+  SUPABASE_URL = new URL(RAW_SUPABASE_URL).origin;
+} catch (e) {
+  console.error(`❌ Error: SUPABASE_URL is not a valid URL: "${RAW_SUPABASE_URL}"`);
   process.exit(1);
 }
 
@@ -62,12 +74,79 @@ function calculateChecksum(content) {
   return crypto.createHash('md5').update(content, 'utf8').digest('hex');
 }
 
+// SECURITY DEFINER function that records a migration on behalf of the
+// caller, bypassing row-level security on schema_migrations (the runner
+// connects with the anon key, which is subject to RLS policies).
+//
+// The trailing NOTIFY asks PostgREST to reload its schema cache immediately.
+// Supabase auto-reloads on DDL via an event trigger, but that reload is
+// asynchronous, so calling the RPC right after creating/replacing it can
+// still race the cache and fail with "Could not find the function ... in
+// the schema cache". The explicit NOTIFY plus the retry wrapper around the
+// RPC call (see callRpcWithSchemaCacheRetry) close that race.
+const RECORD_MIGRATION_FUNCTION_SQL = `
+CREATE OR REPLACE FUNCTION record_migration(p_migration_name TEXT, p_checksum TEXT, p_execution_time_ms INTEGER)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  INSERT INTO schema_migrations (migration_name, checksum, execution_time_ms)
+  VALUES (p_migration_name, p_checksum, p_execution_time_ms);
+END;
+$$;
+
+-- SECURITY DEFINER counterpart to record_migration: reads schema_migrations
+-- on behalf of the caller, bypassing row-level security. Without this, the
+-- runner (connected with the anon key, subject to RLS) sees an empty table
+-- even when migrations were already recorded, and re-attempts them, which
+-- then fails with a duplicate key error from record_migration's insert.
+CREATE OR REPLACE FUNCTION get_executed_migrations()
+RETURNS TABLE(migration_name TEXT, checksum TEXT)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  RETURN QUERY SELECT sm.migration_name, sm.checksum FROM schema_migrations sm ORDER BY sm.migration_name;
+END;
+$$;
+NOTIFY pgrst, 'reload schema';
+`;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isSchemaCacheMiss(error) {
+  return !!error && (error.code === 'PGRST202' || /schema cache/i.test(error.message || ''));
+}
+
+/**
+ * Call a Supabase RPC function, retrying with backoff if PostgREST hasn't
+ * yet reloaded its schema cache for a function that was just created.
+ */
+async function callRpcWithSchemaCacheRetry(fnName, params, { retries = 5, baseDelayMs = 400 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const { data, error } = await supabase.rpc(fnName, params);
+    if (!error) {
+      return { data, error: null };
+    }
+    lastError = error;
+    if (!isSchemaCacheMiss(error) || attempt === retries) {
+      return { data, error };
+    }
+    await sleep(baseDelayMs * (attempt + 1));
+  }
+  return { data: null, error: lastError };
+}
+
 /**
  * Setup migration infrastructure (tracking table + helper function)
  */
 async function setupMigrationInfrastructure() {
   console.log('📋 Setting up migration infrastructure...\n');
-  
+
   const setupSQL = `
 -- Create schema_migrations table for tracking
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -78,7 +157,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   execution_time_ms INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_schema_migrations_name 
+CREATE INDEX IF NOT EXISTS idx_schema_migrations_name
   ON schema_migrations(migration_name);
 
 -- Create helper function to execute raw SQL
@@ -91,6 +170,7 @@ BEGIN
   EXECUTE sql_query;
 END;
 $$;
+${RECORD_MIGRATION_FUNCTION_SQL}
   `;
   
   console.log('📝 Please execute the following SQL in your Supabase SQL Editor:');
@@ -145,10 +225,7 @@ async function checkInfrastructure() {
  * Get list of already executed migrations
  */
 async function getExecutedMigrations() {
-  const { data, error } = await supabase
-    .from('schema_migrations')
-    .select('migration_name, checksum')
-    .order('migration_name');
+  const { data, error } = await callRpcWithSchemaCacheRetry('get_executed_migrations', {});
 
   if (error) {
     console.error('❌ Error fetching executed migrations:', error.message);
@@ -201,14 +278,16 @@ async function executeMigration(filename, content, checksum) {
   
   const executionTime = Date.now() - startTime;
   
-  // Record the migration in schema_migrations table
-  const { error: recordError } = await supabase
-    .from('schema_migrations')
-    .insert({
-      migration_name: filename,
-      checksum,
-      execution_time_ms: executionTime
-    });
+  // Record the migration via the record_migration RPC (a SECURITY DEFINER
+  // function), since inserting directly into schema_migrations is blocked
+  // by row-level security when connecting with the anon key. Retried
+  // because the function may have just been (re)created this run and
+  // PostgREST's schema cache reload is asynchronous.
+  const { error: recordError } = await callRpcWithSchemaCacheRetry('record_migration', {
+    p_migration_name: filename,
+    p_checksum: checksum,
+    p_execution_time_ms: executionTime
+  });
   
   if (recordError) {
     console.error(`  ❌ Error recording migration ${filename}:`, recordError.message);
@@ -249,7 +328,23 @@ async function runMigrations() {
   }
   
   console.log('✅ Migration infrastructure ready\n');
-  
+
+  // Ensure the record_migration/get_executed_migrations helpers exist and are
+  // up to date. Existing projects may already have exec_migration_sql (so
+  // checkInfrastructure passes and the setup SQL above never gets run)
+  // without these newer helpers, so (re)create them here via the helper we
+  // know is present.
+  const { error: ensureRecordFnError } = await supabase
+    .rpc('exec_migration_sql', { sql_query: RECORD_MIGRATION_FUNCTION_SQL });
+  if (ensureRecordFnError) {
+    console.error('❌ Error creating record_migration/get_executed_migrations helpers:', ensureRecordFnError.message);
+    process.exit(1);
+  }
+
+  // Give PostgREST a moment to pick up the NOTIFY and reload its schema
+  // cache before the first record_migration RPC call below.
+  await sleep(500);
+
   // Get list of executed migrations
   const executedMigrations = await getExecutedMigrations();
   console.log(`📊 Previously executed: ${executedMigrations.size} migrations\n`);
