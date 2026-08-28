@@ -8,6 +8,7 @@ import KeyStatsCard from './KeyStatsCard';
 import AgentStoryCard from './AgentStoryCard';
 import PriceGraph from './PriceGraph';
 import BrokerFlowCard from './BrokerFlowCard';
+import CleanMoney from '@/app/components/CleanMoney';
 import EmitenHistoryCard from './EmitenHistoryCard';
 
 import * as htmlToImage from 'html-to-image';
@@ -452,6 +453,10 @@ export default function Calculator({ selectedStock }: CalculatorProps) {
               <div style={{ flex: '1 1 0', minWidth: '400px', display: 'flex' }}>
                 <BrokerFlowCard emiten={result.input.emiten} />
               </div>
+            </div>
+            {/* Clean Money Section */}
+            <div style={{ gridColumn: '1 / -1', width: '100%' }}>
+              <CleanMoney emiten={result.input.emiten} />
             </div>
 
             {/* Agent Story Section - Full Width */}
